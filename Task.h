@@ -5,24 +5,27 @@
 
 #include "common.h"
 #include <string>
-#include <memory>
 
 class Args;
 class Result;
+class Background;
 
 struct Task {
-  enum Kind {NONE = 0, PRP};
+  enum Kind {NONE = 0, PRP, PM1};
 
   Kind kind;
   u32 exponent;
   string AID;  
   string line; // the verbatim worktodo line, used in deleteTask().
 
-  // PRP,P-1
-  u32 B1;
-  u32 B2;
+  // PM1
+  u32 B1 = 0;
+  u32 B2 = 0;
 
   operator bool() { return kind != NONE; }
 
-  bool execute(const Args &args);
+  bool execute(const Args& args, Background& background);
+
+  bool writeResultPRP(const Args&, bool isPrime, u64 res64, u32 fftSize) const;
+  bool writeResultPM1(const Args&, const std::string& factor, u32 fftSize) const;
 };

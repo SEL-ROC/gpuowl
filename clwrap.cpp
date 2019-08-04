@@ -1,37 +1,81 @@
 // Copyright (C) 2017-2018 Mihai Preda.
 
-#include "clwrap.h"
+#include "clpp.h"
 #include "timeutil.h"
 #include "file.h"
 
 #include <cstdio>
 #include <cstdarg>
 #include <cassert>
+#include <string>
+#include <new>
+#include <memory>
 
-bool check(int err, const char *mes) {
-  bool ok = (err == CL_SUCCESS);
-  if (!ok) {
-    if (mes) {
-      log("error %d (%s)\n", err, mes);
-    } else {
-      log("error %d\n", err);
-    }
-  }
-  return ok;
+using namespace std;
+
+// starting at 0 to -70
+array<string, 71> ERR_MES = {
+"SUCCESS", "DEVICE_NOT_FOUND", "DEVICE_NOT_AVAILABLE", "COMPILER_NOT_AVAILABLE",
+"MEM_OBJECT_ALLOCATION_FAILURE", "OUT_OF_RESOURCES", "OUT_OF_HOST_MEMORY", "PROFILING_INFO_NOT_AVAILABLE",
+"MEM_COPY_OVERLAP", "IMAGE_FORMAT_MISMATCH", "IMAGE_FORMAT_NOT_SUPPORTED", "BUILD_PROGRAM_FAILURE",
+"MAP_FAILURE", "MISALIGNED_SUB_BUFFER_OFFSET", "EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST", "COMPILE_PROGRAM_FAILURE",
+"LINKER_NOT_AVAILABLE", "LINK_PROGRAM_FAILURE", "DEVICE_PARTITION_FAILED", "KERNEL_ARG_INFO_NOT_AVAILABLE",
+"", "", "", "", "", "", "", "", "", "",
+"INVALID_VALUE", "INVALID_DEVICE_TYPE", "INVALID_PLATFORM", "INVALID_DEVICE",
+"INVALID_CONTEXT", "INVALID_QUEUE_PROPERTIES", "INVALID_COMMAND_QUEUE", "INVALID_HOST_PTR",
+"INVALID_MEM_OBJECT", "INVALID_IMAGE_FORMAT_DESCRIPTOR", "INVALID_IMAGE_SIZE", "INVALID_SAMPLER",
+"INVALID_BINARY", "INVALID_BUILD_OPTIONS", "INVALID_PROGRAM", "INVALID_PROGRAM_EXECUTABLE",
+"INVALID_KERNEL_NAME", "INVALID_KERNEL_DEFINITION", "INVALID_KERNEL", "INVALID_ARG_INDEX",
+"INVALID_ARG_VALUE", "INVALID_ARG_SIZE", "INVALID_KERNEL_ARGS", "INVALID_WORK_DIMENSION",
+"INVALID_WORK_GROUP_SIZE", "INVALID_WORK_ITEM_SIZE", "INVALID_GLOBAL_OFFSET", "INVALID_EVENT_WAIT_LIST",
+"INVALID_EVENT", "INVALID_OPERATION", "INVALID_GL_OBJECT", "INVALID_BUFFER_SIZE",
+"INVALID_MIP_LEVEL", "INVALID_GLOBAL_WORK_SIZE", "INVALID_PROPERTY", "INVALID_IMAGE_DESCRIPTOR",
+"INVALID_COMPILER_OPTIONS", "INVALID_LINKER_OPTIONS", "INVALID_DEVICE_PARTITION_COUNT", "INVALID_PIPE_SIZE",
+"INVALID_DEVICE_QUEUE"
+};
+
+static string errMes(int err) {
+  return (err <= 0 && err >= -70) ? ERR_MES[-err] : ""s;
 }
 
-#define CHECK(what) assert(check(what));
-#define CHECK2(what, mes) assert(check(what, mes));
+class gpu_error : public std::runtime_error {
+public:
+  const int err;
+  
+  gpu_error(int err, const string& mes) : runtime_error(errMes(err) + " " + mes), err(err) {}
+
+  gpu_error(int err, const char *file, int line, const char *func, const string& mes)
+    : gpu_error(err, mes + " at " + file + ":" + to_string(line) + " " + func) {
+  }
+};
+
+class gpu_bad_alloc : public std::bad_alloc {
+  string w;
+  
+public:
+  gpu_bad_alloc(const string& w) : w(w) {}
+  gpu_bad_alloc(size_t size) : gpu_bad_alloc("GPU size "s + to_string(size)) {}
+
+  const char *what() const noexcept override { return w.c_str(); }
+};
+
+void check(int err, const char *file, int line, const char *func, const string& mes) {  
+  if (err != CL_SUCCESS) {
+    // log("CL error %s (%d) %s\n", errMes(err).c_str(), err, mes.c_str());
+    throw gpu_error(err, file, line, func, mes);
+  }
+}
 
 vector<cl_device_id> getDeviceIDs(bool onlyGPU) {
   cl_platform_id platforms[16];
   int nPlatforms = 0;
-  CHECK(clGetPlatformIDs(16, platforms, (unsigned *) &nPlatforms));
+  CHECK1(clGetPlatformIDs(16, platforms, (unsigned *) &nPlatforms));
   vector<cl_device_id> ret;
   cl_device_id devices[64];
   for (int i = 0; i < nPlatforms; ++i) {
     unsigned n = 0;
-    CHECK(clGetDeviceIDs(platforms[i], onlyGPU ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_ALL, 64, devices, &n));
+    auto kind = onlyGPU ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_ALL;
+    CHECK1(clGetDeviceIDs(platforms[i], kind, 64, devices, &n));
     for (unsigned k = 0; k < n; ++k) { ret.push_back(devices[k]); }
   }
   return ret;
@@ -40,21 +84,27 @@ vector<cl_device_id> getDeviceIDs(bool onlyGPU) {
 int getNumberOfDevices() {
   cl_platform_id platforms[8];
   unsigned nPlatforms;
-  CHECK(clGetPlatformIDs(8, platforms, &nPlatforms));
+  CHECK1(clGetPlatformIDs(8, platforms, &nPlatforms));
   
   unsigned n = 0;
   for (int i = 0; i < (int) nPlatforms; ++i) {
     unsigned delta = 0;
-    CHECK(clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, 0, NULL, &delta));
+    CHECK1(clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, 0, NULL, &delta));
     n += delta;
   }
   return n;
 }
 
-void getInfo(cl_device_id id, int what, size_t bufSize, void *buf) { CHECK(clGetDeviceInfo(id, what, bufSize, buf, NULL)); }
+void getInfo(cl_device_id id, int what, size_t bufSize, void *buf) { CHECK1(clGetDeviceInfo(id, what, bufSize, buf, NULL)); }
 
 bool getInfoMaybe(cl_device_id id, int what, size_t bufSize, void *buf) {
   return clGetDeviceInfo(id, what, bufSize, buf, NULL) == CL_SUCCESS;
+}
+
+u64 getFreeMem(cl_device_id id) {
+  u64 memSize = 0;
+  getInfo(id, CL_DEVICE_GLOBAL_FREE_MEMORY_AMD, sizeof(memSize), &memSize);
+  return memSize * 1024; // KB to Bytes.
 }
 
 static string getTopology(cl_device_id id) {
@@ -90,78 +140,63 @@ static string getFreq(cl_device_id device) {
 string getShortInfo(cl_device_id device) { return getHwName(device) + "-" + getFreq(device) + "-" + getTopology(device); }
 string getLongInfo(cl_device_id device) { return getShortInfo(device) + " " + getBoardName(device); }
 
-cl_context createContext(cl_device_id device) {
+cl_device_id getDevice(int argsDevId) {
+  cl_device_id device = nullptr;
+  if (argsDevId >= 0) {
+    auto devices = getDeviceIDs(false);    
+    assert(int(devices.size()) > argsDevId);
+    device = devices[argsDevId];
+  } else {
+    auto devices = getDeviceIDs(true);
+    if (devices.empty()) {
+      log("No GPU device found. See -h for how to select a specific device.\n");
+      throw("No device specified, and no GPU device found");
+    }
+    device = devices[0];
+  }
+  return device;
+}
+
+Context createContext(cl_device_id id) {  
   int err;
-  cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+  Context context(clCreateContext(NULL, 1, &id, NULL, NULL, &err));
   CHECK2(err, "clCreateContext");
   return context;
 }
 
-void release(cl_context context) { CHECK(clReleaseContext(context)); }
-void release(cl_program program) { CHECK(clReleaseProgram(program)); }
-void release(cl_mem buf)         { CHECK(clReleaseMemObject(buf)); }
-void release(cl_queue queue)     { CHECK(clReleaseCommandQueue(queue)); }
-void release(cl_kernel k)        { CHECK(clReleaseKernel(k)); }
 
-bool dumpBinary(cl_program program, const string &fileName) {
+void release(cl_context context) { CHECK1(clReleaseContext(context)); }
+void release(cl_program program) { CHECK1(clReleaseProgram(program)); }
+void release(cl_mem buf)         { CHECK1(clReleaseMemObject(buf)); }
+void release(cl_queue queue)     { CHECK1(clReleaseCommandQueue(queue)); }
+void release(cl_kernel k)        { CHECK1(clReleaseKernel(k)); }
+
+void dumpBinary(cl_program program, const string &fileName) {
   if (auto fo = openWrite(fileName)) {
     size_t size;
-    CHECK(clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size), &size, NULL));
+    CHECK1(clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size), &size, NULL));
     char *buf = new char[size + 1];
-    CHECK(clGetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(&buf), &buf, NULL));
-    fwrite(buf, 1, size, fo.get());
+    CHECK1(clGetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(&buf), &buf, NULL));
+    auto nWrote = fwrite(buf, size, 1, fo.get());
+    assert(nWrote == 1);
     delete[] buf;
-    return true; 
+  } else {
+    throw "dump "s + fileName;
   }
-  return false;
 }
 
-static string readFile(const string &name) {
-  string ret;
-  if (auto fi = openRead(name)) {
-    char buf[1024];
-    while (true) {
-      size_t n = fread(buf, 1, sizeof(buf), fi.get());
-      ret.append(buf, n);
-      if (n < sizeof(buf)) { break; }
-    }
-  }
-  return ret;
-}
-
-static cl_program loadBinary(cl_device_id device, cl_context context, const string &binFile) {
-  string binary = readFile(binFile);
-  cl_program program = 0;
-  if (!binary.empty()) {  
-    cl_device_id devices[] = {device};
-    size_t sizes[] = {binary.size()};
-    const unsigned char *binaries[] = {(const unsigned char *) binary.c_str()};
-    int binStatus[] = {0};
-    int err = 0;
-    program = clCreateProgramWithBinary(context, 1, devices, sizes, binaries, binStatus, &err);
-    if (err != CL_SUCCESS) {
-      log("Error loading pre-compiled kernel from '%s' (error %d, %d)\n", binFile.c_str(), err, binStatus[0]);
-    } else {
-      log("Loaded pre-compiled kernel from '%s'\n", binFile.c_str());
-    }
-  }
-  return program;
-}
-
-static cl_program loadSource(cl_context context, const string &name) {
-  string stub = string("#include \"") + name + ".cl\"\n";
-  
-  const char *ptr = stub.c_str();
-  size_t size = stub.size();
+static cl_program loadSource(cl_context context, const string &source) {
+  const char *ptr = source.c_str();
+  size_t size = source.size();
   int err;
   cl_program program = clCreateProgramWithSource(context, 1, &ptr, &size, &err);
   CHECK2(err, "clCreateProgramWithSource");
-  return program;  
+  return program;
 }
 
-static bool build(cl_program program, cl_device_id device, const string &args) {
+static void build(cl_program program, cl_device_id device, const string &args) {
   Timer timer;
-  int err = clBuildProgram(program, 1, &device, args.c_str(), NULL, NULL);
+  int err = clBuildProgram(program, 0, NULL, args.c_str(), NULL, NULL);
   bool ok = (err == CL_SUCCESS);
   if (!ok) { log("OpenCL compilation error %d (args %s)\n", err, args.c_str()); }
   
@@ -173,38 +208,46 @@ static bool build(cl_program program, cl_device_id device, const string &args) {
     buf.get()[logSize] = 0;
     log("%s\n", buf.get());
   }
-  if (ok) { log("OpenCL compilation in %d ms, with \"%s\"\n", timer.deltaMillis(), args.c_str()); }
-  return ok;
+  if (ok) {
+    log("OpenCL compilation in %d ms\n", timer.deltaMillis());
+  } else {
+    release(program);
+    CHECK2(err, "clBuildProgram");
+  }
 }
 
-cl_program compile(cl_device_id device, cl_context context, const string &name, const string &extraArgs,
-                   const vector<pair<string, unsigned>> &defines, bool usePrecompiled) {
-  string strDefines;
-  string config;
-  for (auto d : defines) {
-    strDefines = strDefines + "-D" + d.first + "=" + to_string(d.second) + "u ";
-    config = config + "_" + to_string(d.second);
+std::string toLiteral(const std::any& v) {
+  if (auto *p = std::any_cast<u32>(&v)) {
+    return to_string(*p) + "u";
+  } else if (auto *p = std::any_cast<i32>(&v)) {
+    return to_string(*p);
+  } else if (auto *p = std::any_cast<u64>(&v)) {
+    return to_string(*p) + "ul";
+  } else if (auto *p = std::any_cast<double>(&v)) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%a", *p);
+    return buf;
+  } else {
+    log("No literal formatting defined for type %s\n", v.type().name());
   }
-  string args = strDefines + extraArgs + " " + "-I. -cl-fast-relaxed-math -cl-std=CL2.0 ";
+  assert(false);
+  return "";
+}
 
+cl_program compile(cl_device_id device, cl_context context, const string &source, const string &extraArgs,
+                   const vector<pair<string, std::any>> &defines) {
+  string strDefines;
+  for (auto d : defines) {
+    strDefines = strDefines + "-D" + d.first + "=" + toLiteral(d.second) + ' ';
+  }
+  string args = strDefines + extraArgs + " -I. -cl-fast-relaxed-math -cl-std=CL2.0";
+  log("OpenCL args \"%s\"\n", args.c_str());
+  
   cl_program program = 0;
 
-  string binFile = string("precompiled/") + getHwName(device) + "_" + name + config + ".so";
-  if (usePrecompiled && (program = loadBinary(device, context, binFile))) {
-    if (build(program, device, args)) {
-      return program;
-    } else {
-      release(program);
-    }
-  }
-
-  if ((program = loadSource(context, name))) {
-    if (build(program, device, args)) {
-      if (usePrecompiled) { dumpBinary(program, binFile); }      
-      return program;
-    } else {
-      release(program);
-    }
+  if ((program = loadSource(context, source))) {
+    build(program, device, args);
+    return program;
   }
   
   return 0;
@@ -221,16 +264,16 @@ cl_kernel makeKernel(cl_program program, const char *name) {
   return k;
 }
 
-void setArg(cl_kernel k, int pos, const Buffer &buf) { setArg(k, pos, buf.get()); }
-
-cl_mem makeBuf(cl_context context, unsigned kind, size_t size, const void *ptr) {
+cl_mem _makeBuf(cl_context context, unsigned kind, size_t size, const void *ptr) {
+  // if (getFreeMem(
+  
   int err;
   cl_mem buf = clCreateBuffer(context, kind, size, (void *) ptr, &err);
+  if (err == CL_OUT_OF_RESOURCES || err == CL_MEM_OBJECT_ALLOCATION_FAILURE) { throw gpu_bad_alloc(size); }
+  
   CHECK2(err, "clCreateBuffer");
   return buf;
 }
-
-cl_mem makeBuf(Context &context, unsigned kind, size_t size, const void *ptr) { return makeBuf(context.get(), kind, size, ptr); }
 
 cl_queue makeQueue(cl_device_id d, cl_context c) {
   int err;
@@ -239,36 +282,38 @@ cl_queue makeQueue(cl_device_id d, cl_context c) {
   return q;
 }
 
-void flush( cl_queue q) { CHECK(clFlush(q)); }
-void finish(cl_queue q) { CHECK(clFinish(q)); }
+void flush( cl_queue q) { CHECK1(clFlush(q)); }
+void finish(cl_queue q) { CHECK1(clFinish(q)); }
 
 void run(cl_queue queue, cl_kernel kernel, size_t groupSize, size_t workSize, const string &name) {
   CHECK2(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &workSize, &groupSize, 0, NULL, NULL), name.c_str());
 }
 
 void read(cl_queue queue, bool blocking, cl_mem buf, size_t size, void *data, size_t start) {
-  CHECK(clEnqueueReadBuffer(queue, buf, blocking, start, size, data, 0, NULL, NULL));
-}
-
-void read(cl_queue queue, bool blocking, Buffer &buf, size_t size, void *data, size_t start) {
-  CHECK(clEnqueueReadBuffer(queue, buf.get(), blocking, start, size, data, 0, NULL, NULL));
+  CHECK1(clEnqueueReadBuffer(queue, buf, blocking, start, size, data, 0, NULL, NULL));
 }
 
 void write(cl_queue queue, bool blocking, cl_mem buf, size_t size, const void *data, size_t start) {
-  CHECK(clEnqueueWriteBuffer(queue, buf, blocking, start, size, data, 0, NULL, NULL));
+  CHECK1(clEnqueueWriteBuffer(queue, buf, blocking, start, size, data, 0, NULL, NULL));
+}
+
+/*
+void read(cl_queue queue, bool blocking, Buffer &buf, size_t size, void *data, size_t start) {
+  CHECK1(clEnqueueReadBuffer(queue, buf.get(), blocking, start, size, data, 0, NULL, NULL));
 }
 
 void write(cl_queue queue, bool blocking, Buffer &buf, size_t size, const void *data, size_t start) {
-  CHECK(clEnqueueWriteBuffer(queue, buf.get(), blocking, start, size, data, 0, NULL, NULL));
+  CHECK1(clEnqueueWriteBuffer(queue, buf.get(), blocking, start, size, data, 0, NULL, NULL));
 }
+*/
 
-void copyBuf(cl_queue queue, Buffer &src, Buffer &dst, size_t size) {
-  CHECK(clEnqueueCopyBuffer(queue, src.get(), dst.get(), 0, 0, size, 0, NULL, NULL));
+void copyBuf(cl_queue queue, const cl_mem src, cl_mem dst, size_t size) {
+  CHECK1(clEnqueueCopyBuffer(queue, src, dst, 0, 0, size, 0, NULL, NULL));
 }
 
 int getKernelNumArgs(cl_kernel k) {
   int nArgs = 0;
-  CHECK(clGetKernelInfo(k, CL_KERNEL_NUM_ARGS, sizeof(nArgs), &nArgs, NULL));
+  CHECK1(clGetKernelInfo(k, CL_KERNEL_NUM_ARGS, sizeof(nArgs), &nArgs, NULL));
   return nArgs;
 }
 
@@ -281,32 +326,37 @@ int getWorkGroupSize(cl_kernel k, cl_device_id device, const char *name) {
 std::string getKernelArgName(cl_kernel k, int pos) {
   char buf[128];
   size_t size = 0;
-  CHECK(clGetKernelArgInfo(k, pos, CL_KERNEL_ARG_NAME, sizeof(buf), buf, &size));
+  CHECK1(clGetKernelArgInfo(k, pos, CL_KERNEL_ARG_NAME, sizeof(buf), buf, &size));
   assert(size >= 0 && size < sizeof(buf));
   buf[size] = 0;
   return buf;
 }
 
+/*
 void Queue::zero(Buffer &buf, size_t size) {
   assert(size % sizeof(int) == 0);
   int zero = 0;
-  CHECK(clEnqueueFillBuffer(queue.get(), buf.get(), &zero, sizeof(zero), 0, size, 0, 0, 0));
+  fillBuf(queue.get(), buf, &zero, sizeof(zero), size);
+  // CHECK(clEnqueueFillBuffer(queue.get(), buf.get(), &zero, sizeof(zero), 0, size, 0, 0, 0));
   // finish();
 }
+*/
 
-cl_device_id getDevice(int argsDevId) {
-  cl_device_id device = nullptr;
-  if (argsDevId >= 0) {
-    auto devices = getDeviceIDs(false);    
-    assert(int(devices.size()) > argsDevId);
-    device = devices[argsDevId];
-  } else {
-    auto devices = getDeviceIDs(true);
-    if (devices.empty()) {
-      log("No GPU device found. See -h for how to select a specific device.\n");
-      return 0;
+void fillBuf(cl_queue q, cl_mem buf, void *pat, size_t patSize, size_t size, size_t start) {
+  CHECK1(clEnqueueFillBuffer(q, buf, pat, patSize, start, size ? size : patSize, 0, 0, 0));
+}
+
+u32 getAllocableBlocks(cl_device_id device, u32 blockSize, u32 minFree) {
+  vector<Buffer<std::byte>> buffers;
+
+  Context context = createContext(device);
+  
+  while (getFreeMem(device) >= minFree) {
+    try {
+      buffers.emplace_back(context, BUF_RW, blockSize);
+    } catch (const bad_alloc&) {
+      break;
     }
-    device = devices[0];
   }
-  return device;
+  return buffers.empty() ? 0 : (buffers.size() - 1);
 }

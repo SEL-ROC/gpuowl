@@ -1,30 +1,33 @@
-// Copyright 2017 Mihai Preda.
+// Copyright Mihai Preda.
 
 #pragma once
 
-#include "clwrap.h"
+#include "clpp.h"
 #include "common.h"
 #include "kernel.h"
 
 #include <vector>
 #include <string>
 #include <memory>
+#include <variant>
 
 struct Args;
 struct PRPResult;
 struct PRPState;
-class GCD;
+
+using double2 = pair<double, double>;
 
 class Gpu {
   u32 E;
   u32 N;
 
-  int hN, nW, nH, bufSize;
+  u32 hN, nW, nH, bufSize;
   bool useLongCarry;
   bool useMiddle;
 
-  unique_ptr<GCD> gcd;
-  
+  cl_device_id device;
+  Context context;
+  Holder<cl_program> program;
   Queue queue;
   
   Kernel carryFused;
@@ -42,60 +45,77 @@ class Gpu {
   Kernel transposeW, transposeH;
   Kernel transposeIn, transposeOut;
 
-  Kernel square;
   Kernel multiply;
-  Kernel multiplySub;
+  Kernel square;
   Kernel tailFused;
+  Kernel tailFusedMulDelta;
+  
   Kernel readResidue;
   Kernel isNotZero;
   Kernel isEqual;
+
+  // Trigonometry constant buffers, used in FFTs.
+  Buffer<double2> bufTrigW;
+  Buffer<double2> bufTrigH; 
+
+  // Weight constant buffers, with the direct and inverse weights. N x double.
+  Buffer<double> bufWeightA;      // Direct weights.
+  Buffer<double> bufWeightI;      // Inverse weights.
+
+  Buffer<u32> bufBits;
+  Buffer<u32> bufExtras;
+  Buffer<double> bufGroupWeights;
+  Buffer<double> bufThreadWeights;
   
-  Buffer bufData, bufCheck, bufAux, bufBase, bufAcc;
-  Buffer bufTrigW, bufTrigH;
-  Buffer bufA, bufI;
-  Buffer buf1, buf2, buf3;
-  Buffer bufCarry;
-  Buffer bufReady;
-  Buffer bufSmallOut;
-  Buffer bufBaseDown;
+  // "integer word" buffers. These are "small buffers": N x int.
+  Buffer<int> bufData;   // Main int buffer with the words.
+  Buffer<int> bufAux;    // Auxiliary int buffer, used in transposing data in/out and in check.
+  Buffer<int> bufCheck;  // Buffers used with the error check.
+  
+  // Carry buffers, used in carry and fusedCarry.
+  Buffer<i64> bufCarry;  // Carry shuttle.
+  
+  Buffer<int> bufReady;  // Per-group ready flag for starway carry propagation.
+
+  // Small aux buffer used to read res64.
+  Buffer<int> bufSmallOut;
 
   vector<u32> computeBase(u32 E, u32 B1);
   pair<vector<u32>, vector<u32>> seedPRP(u32 E, u32 B1);
   
-  vector<int> readSmall(Buffer &buf, u32 start);
+  vector<int> readSmall(Buffer<int>& buf, u32 start);
 
-  void tW(Buffer &in, Buffer &out);
-  void tH(Buffer &in, Buffer &out);
-  void exitKerns(Buffer &buf, Buffer &bufWords);
+  void tW(Buffer<double>& in, Buffer<double>& out);
+  void tH(Buffer<double>& in, Buffer<double>& out);
   
-  void copyFromTo(Buffer &from, Buffer &to);
+  vector<int> readOut(Buffer<int> &buf);
+  void writeIn(const vector<u32> &words, Buffer<int>& buf);
+  void writeIn(const vector<int> &words, Buffer<int>& buf);
   
-  vector<int> readOut(Buffer &buf);
-  void writeIn(const vector<u32> &words, Buffer &buf);
-  void writeIn(const vector<int> &words, Buffer &buf);
+  void modSqLoop(u32 reps, bool mul3, Buffer<double>& buf1, Buffer<double>& buf2, Buffer<int>& io);
   
-  void modSqLoopMul(Buffer &io, const vector<bool> &muls);
-  void modSqLoopAcc(Buffer &io, const vector<bool> &muls);
-  
-  void modMul(Buffer &in, Buffer &io);
-  bool equalNotZero(Buffer &bufCheck, Buffer &bufAux);
-  u64 bufResidue(Buffer &buf);
+  void modMul(Buffer<int>& in, bool mul3, Buffer<double>& buf1, Buffer<double>& buf2, Buffer<double>& buf3, Buffer<int>& io);
+  bool equalNotZero(Buffer<int>& bufCheck, Buffer<int>& bufAux);
+  u64 bufResidue(Buffer<int>& buf);
   
   vector<u32> writeBase(const vector<u32> &v);
 
-  PRPState loadPRP(u32 E, u32 iniB1, u32 iniBlockSize);
-  void doStage0(u32 k, u32 B1, u32 blockSize, vector<u32> &&base, vector<bool> &&basePower);
+  PRPState loadPRP(u32 E, u32 iniBlockSize, Buffer<double>&, Buffer<double>&, Buffer<double>&);
+
+  void coreStep(bool leadIn, bool leadOut, bool mul3, Buffer<double>& buf1, Buffer<double>& buf2, Buffer<int>& io);
+
+  void multiplyLow(Buffer<double>& in, Buffer<double>& tmp, Buffer<double>& io);
+  void exponentiate(Buffer<double>& base, u64 exp, Buffer<double>& tmp, Buffer<double>& out);
+  void topHalf(Buffer<double>& tmp, Buffer<double>& io);
+  void writeState(const vector<u32> &check, u32 blockSize, Buffer<double>&, Buffer<double>&, Buffer<double>&);
   
 public:
   static unique_ptr<Gpu> make(u32 E, const Args &args);
   
-  Gpu(u32 E, u32 W, u32 BIG_H, u32 SMALL_H, int nW, int nH,
-      cl_program program, cl_device_id device, cl_context context,
-      bool timeKernels, bool useLongCarry);
+  Gpu(const Args& args, u32 E, u32 W, u32 BIG_H, u32 SMALL_H, u32 nW, u32 nH,
+      cl_device_id device, bool timeKernels, bool useLongCarry);
 
-  ~Gpu();
-  
-  void writeState(const vector<u32> &check, const vector<u32> &base, const vector<u32> &gcdAcc, u32 blockSize);
+
   
   vector<u32> roundtripData()  { return writeData(readData()); }
   vector<u32> roundtripCheck() { return writeCheck(readCheck()); }
@@ -106,21 +126,19 @@ public:
   u64 dataResidue()  { return bufResidue(bufData); }
   u64 checkResidue() { return bufResidue(bufCheck); }
     
-  bool doCheck(int blockSize);
-  void updateCheck();
+  bool doCheck(u32 blockSize, Buffer<double>&, Buffer<double>&, Buffer<double>&);
+  void updateCheck(Buffer<double>& buf1, Buffer<double>& buf2, Buffer<double>& buf3);
 
-  void dataLoopMul(const vector<bool> &muls) { modSqLoopMul(bufData, muls); }
-  void dataLoopAcc(const vector<bool> &accs) { modSqLoopAcc(bufData, accs); }
-  u32 dataLoopAcc(u32 begin, u32 end, const vector<bool> &kset);
-  
   void finish();
 
   void logTimeKernels();
 
   vector<u32> readCheck();
   vector<u32> readData();
-  vector<u32> readAcc();
 
-  PRPResult isPrimePRP(u32 E, const Args &args, u32 B1, u32 B2);
+  std::pair<bool, u64> isPrimePRP(u32 E, const Args &args);
+
+  std::variant<string, vector<u32>> factorPM1(u32 E, const Args& args, u32 B1, u32 B2);
+  
   u32 getFFTSize() { return N; }
 };
